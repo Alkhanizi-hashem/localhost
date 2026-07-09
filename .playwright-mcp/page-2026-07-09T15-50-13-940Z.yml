@@ -1,0 +1,24 @@
+- generic [active] [ref=f4e1]:
+  - heading "Localhost Rust Server" [level=1] [ref=f4e2]
+  - paragraph [ref=f4e3]: This page is served by the custom HTTP/1.1 server.
+  - heading "Upload" [level=2] [ref=f4e4]
+  - generic [ref=f4e5]:
+    - button "Choose File" [ref=f4e6]
+    - button "Upload" [ref=f4e7]
+  - heading "Links" [level=2] [ref=f4e8]
+  - list [ref=f4e9]:
+    - listitem [ref=f4e10]:
+      - link "Directory listing for uploads" [ref=f4e11] [cursor=pointer]:
+        - /url: /uploads/
+    - listitem [ref=f4e12]:
+      - link "Directory listing example" [ref=f4e13] [cursor=pointer]:
+        - /url: /listing/
+    - listitem [ref=f4e14]:
+      - link "Python CGI echo" [ref=f4e15] [cursor=pointer]:
+        - /url: /cgi/echo.py?source=browser
+    - listitem [ref=f4e16]:
+      - link "Cookie-backed session page" [ref=f4e17] [cursor=pointer]:
+        - /url: /session
+    - listitem [ref=f4e18]:
+      - link "Redirect example" [ref=f4e19] [cursor=pointer]:
+        - /url: /old

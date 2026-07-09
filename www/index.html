@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Localhost Rust Server</title>
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            margin: 2rem auto;
+            max-width: 48rem;
+            line-height: 1.5;
+        }
+        code {
+            background: #f0f0f0;
+            padding: 0.1rem 0.3rem;
+        }
+        form {
+            border: 1px solid #ccc;
+            padding: 1rem;
+            margin-block: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <h1>Localhost Rust Server</h1>
+    <p>This page is served by the custom HTTP/1.1 server.</p>
+
+    <h2>Upload</h2>
+    <form method="post" action="/uploads" enctype="multipart/form-data">
+        <input type="file" name="file">
+        <button type="submit">Upload</button>
+    </form>
+
+    <h2>Links</h2>
+    <ul>
+        <li><a href="/uploads/">Directory listing for uploads</a></li>
+        <li><a href="/listing/">Directory listing example</a></li>
+        <li><a href="/cgi/echo.py?source=browser">Python CGI echo</a></li>
+        <li><a href="/session">Cookie-backed session page</a></li>
+        <li><a href="/old">Redirect example</a></li>
+    </ul>
+</body>
+</html>
