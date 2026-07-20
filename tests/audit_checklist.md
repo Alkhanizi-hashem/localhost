@@ -12,13 +12,13 @@ Use this as a practical audit sheet for this project. Status values mean:
 | Audit point | What to show during audit | Project evidence | Status |
 | --- | --- | --- | --- |
 | How does an HTTP server work? | Explain: bind listener sockets, wait for readiness, accept clients, parse HTTP request, build response, write response, keep alive or close. | `src/main.rs`, `src/server.rs`, `src/http.rs`, `src/router.rs` | PASS |
-| Which I/O multiplexing function is used and how does it work? | Say this server uses Linux `epoll`, not `select`. Show one epoll instance waiting for ready FDs. | `src/epoll.rs:13-35`, `src/server.rs:91-124`, `README.md:83` | PASS |
-| Is the server using only one select/equivalent to read requests and write answers? | Show the main server loop uses one `Epoll` for listeners and client sockets. Mention CGI has its own separate epoll for CGI pipe I/O. | `src/server.rs:65-68`, `src/server.rs:100-124`, `src/cgi.rs:89-116` | PASS |
-| Why is it important to use only one select and how was it achieved? | Explain one event loop avoids blocking per client and scales to many sockets in one thread. Show all listeners and clients are registered in the same epoll set. | `src/server.rs:127-203`, `src/server.rs:228-252`, `README.md:83` | PASS |
-| Is there only one read or write per client per select/equivalent? | Show `read_client()` does one socket `read()` and `write_client()` does one socket `write()` for each event dispatch. | `src/server.rs:286-312`, `src/server.rs:403-459` | PASS |
-| Are return values for I/O functions checked properly? | Walk through `accept`, `read`, `write`, `epoll_ctl`, `epoll_wait`; show `WouldBlock` and `Interrupted` are handled separately. | `src/server.rs:212-224`, `src/server.rs:296-312`, `src/server.rs:421-459`, `src/epoll.rs:19-35`, `src/cgi.rs:129-158` | PASS |
-| If an error is returned on a socket, is the client removed? | Show `close_client(fd)` on read/write/hup/epoll-modify errors. | `src/server.rs:255-284`, `src/server.rs:308-310`, `src/server.rs:397-400`, `src/server.rs:444-447`, `src/server.rs:455-457`, `src/server.rs:564-567` | PASS |
-| Is writing and reading always done through a select/equivalent? | For network sockets: yes, via epoll. For CGI subprocess pipes: also yes, via a dedicated epoll inside CGI runner. | `src/server.rs:100-124`, `src/cgi.rs:89-176` | PASS |
+| Which I/O multiplexing function is used and how does it work? | Say this server uses Linux `epoll`, not `select`. Show the sole epoll instance waiting for listener, client, and CGI-pipe readiness. | `src/epoll.rs:13-35`, `src/server.rs:94`, `123-171`, `README.md:84` | PASS |
+| Is the server using only one select/equivalent to read requests and write answers? | Show the server creates one `Epoll`; listeners, clients, CGI stdin, and CGI stdout are all registered with it. There is no nested CGI wait loop. | `src/server.rs:94`, `134`, `229`, `280`, `569-625`; repository search for `Epoll::new` returns one call | PASS |
+| Why is it important to use only one select and how was it achieved? | Explain one event loop avoids blocking per client and scales to many streams in one thread. Demonstrate that a static request completes while a CGI child sleeps. | `src/server.rs:123-171`, `628-678`, `tests/integration.rs:515-565` | PASS |
+| Is there only one read or write per client per select/equivalent? | Show `handle_client_event` chooses one pending-response write or one request read, never both. The pipelining regression verifies responses are not overwritten. | `src/server.rs:304-333`, `335-362`, `510-567`, `tests/integration.rs:444-493` | PASS |
+| Are return values for I/O functions checked properly? | Walk through `accept`, client/CGI `read` and `write`, `epoll_ctl`, and `epoll_wait`; show `WouldBlock` and `Interrupted` are handled separately. | `src/server.rs:260-272`, `345-360`, `528-566`, `628-661`, `src/cgi.rs:125-167`, `src/epoll.rs:19-35` | PASS |
+| If an error is returned on a socket, is the client removed? | Show `close_client(fd)` on read/write/hup/epoll-modify errors; pending CGI jobs are cancelled and reaped with their client. | `src/server.rs:304-333`, `504-506`, `551-554`, `821-843`, `src/cgi.rs:195-204` | PASS |
+| Is writing and reading always done through a select/equivalent? | All readiness-driven streams use the sole epoll: network sockets and non-blocking CGI pipes. Regular local files are not epoll-compatible on Linux and are ordinary finite filesystem operations, not client communication streams. | `src/server.rs:123-171`, `229`, `280`, `569-661`; `src/cgi.rs:89-97`, `125-167` | PASS |
 
 ## Configuration File
 
@@ -53,7 +53,7 @@ Use this as a practical audit sheet for this project. Status values mean:
 | Wrong URL handled properly | Visit `/missing`; confirm custom 404 page and correct status. | `www/errors/404.html`, `tests/integration.rs:102-107` | MANUAL |
 | Directory listing handled properly | Visit `/listing/`; confirm generated listing page. | `src/router.rs:252-290`, `tests/integration.rs:109-116` | MANUAL |
 | Redirect handled properly | Visit `/old`; confirm `301` and `Location: /`. | `config/default.conf:44-47`, `src/router.rs:37-50`, `tests/integration.rs:125-130` | MANUAL |
-| CGI works with chunked and unchunked data | Test `/cgi/echo.py` with both `Transfer-Encoding: chunked` and `Content-Length`. | `src/cgi.rs`, `src/http.rs:158-167`, `tests/integration.rs:255-298`, `300-331` | PASS |
+| CGI works with chunked and unchunked data | Test `/cgi/echo.py` with both `Transfer-Encoding: chunked` and `Content-Length`; show slow CGI does not stall unrelated clients. | `src/cgi.rs`, `src/http.rs:158-167`, `tests/integration.rs:255-345`, `515-565` | PASS |
 
 ## Port Issues
 
@@ -67,9 +67,9 @@ Use this as a practical audit sheet for this project. Status values mean:
 
 | Audit point | What to run/show | Project evidence | Status |
 | --- | --- | --- | --- |
-| `siege -b [IP]:[PORT]` availability at least 99.5% | Run `tests/stress.sh` or `siege -b http://127.0.0.1:8080/`. Capture result before audit. | `tests/stress.sh` | MANUAL |
-| No memory leak | Run `tests/leak_check.sh` and monitor with `top`/`htop` during `tests/stress.sh`. | `tests/leak_check.sh`, `tests/leaks.md` | MANUAL |
-| No hanging connection | Show timeout handling and stress behavior; check slow partial requests close with `408`. | `src/server.rs:521-555`, `tests/integration.rs:348-397`, `512-558`, `tests/stress.sh`, `tests/leak_check.sh:64-75` | PASS |
+| `siege -b [IP]:[PORT]` availability at least 99.5% | The post-fix 25-concurrent empty-page run completed 133,907 transactions at 100.00% availability with zero failures. | `tests/stress.sh` | PASS |
+| No memory leak | The RSS fallback completed 3,000 requests with zero failures and zero active connections; final RSS was 3,324 KB. `valgrind` was unavailable, so that stronger optional check remains recommended. | `tests/leak_check.sh`, `/tmp/opencode/localhost-leaks/rss-smoke.log`, `tests/leaks.md` | PASS |
+| No hanging connection | Show request and CGI timeout handling, pending-CGI cancellation on disconnect, and stress behavior; check slow partial requests close with `408`. | `src/server.rs:664-715`, `778-843`, `src/cgi.rs:169-204`, `tests/integration.rs:346-394`, `443-565`, `tests/stress.sh` | PASS |
 
 ## Bonus
 
@@ -78,11 +78,13 @@ Use this as a practical audit sheet for this project. Status values mean:
 | More than one CGI system such as Python/C++/Perl | Current default config only ships Python CGI. You would need more `cgi` mappings and scripts to claim this. | `config/default.conf:38-41`, `www/cgi/echo.py` | NO |
 | Second implementation in another language | No second implementation exists in this repository. | Repository structure | NO |
 
-## Known Recheck Before Audit
+## Verified Regressions
 
 | Item | Notes | Status |
 | --- | --- | --- |
-| HTTP/1.1 keep-alive verification | `cargo test` passed once, but `tests/audit_smoke.sh` hit a flaky failure in `supports_http11_keep_alive_on_same_connection`. Re-run this test and manually demo two requests on one TCP connection before the audit. | RECHECK |
+| HTTP/1.1 keep-alive verification | `supports_http11_keep_alive_on_same_connection` passed in both debug and release suites after the CGI event-loop refactor. | PASS |
+| One client I/O operation per event | `supports_pipelined_requests_without_overwriting_responses` verifies two pipelined requests produce two complete ordered responses. | PASS |
+| Slow CGI concurrency | `slow_cgi_does_not_block_other_clients` starts a sleeping CGI request and verifies an unrelated static response arrives in under 700 ms. | PASS |
 
 ## Fast Demo Commands
 

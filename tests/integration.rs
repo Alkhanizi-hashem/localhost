@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct TestServer {
     child: Child,
@@ -330,10 +330,7 @@ fn handles_unchunked_cgi_and_bad_requests_without_crashing() {
     assert!(body.contains("hello world"));
     assert!(body.contains("mode=plain"));
 
-    let response = http_request(
-        port,
-        b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n",
-    );
+    let response = http_request(port, b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
     assert_eq!(response.status, 400);
     assert!(String::from_utf8_lossy(&response.body).contains("Custom 400"));
 
@@ -427,7 +424,10 @@ fn supports_http11_keep_alive_on_same_connection() {
 
     let first = read_response(&mut stream);
     assert_eq!(first.status, 200);
-    assert_eq!(first.headers.get("connection"), Some(&"keep-alive".to_string()));
+    assert_eq!(
+        first.headers.get("connection"),
+        Some(&"keep-alive".to_string())
+    );
     assert!(String::from_utf8_lossy(&first.body).contains("Localhost Test Home"));
 
     stream
@@ -438,6 +438,52 @@ fn supports_http11_keep_alive_on_same_connection() {
     assert_eq!(second.status, 200);
     assert_eq!(second.headers.get("connection"), Some(&"close".to_string()));
     assert!(String::from_utf8_lossy(&second.body).contains("alpha.txt"));
+}
+
+#[test]
+fn supports_pipelined_requests_without_overwriting_responses() {
+    let workspace = TestWorkspace::new("pipelining");
+    workspace.create_site();
+    let port = free_port();
+
+    workspace.write_config(
+        "pipelining.conf",
+        &format!(
+            "request_timeout 2;\n\
+             server {{\n\
+                 host 127.0.0.1;\n\
+                 ports {port};\n\
+                 route / {{ root www; methods GET; index index.html; directory_listing off; }}\n\
+                 route /listing {{ root www/listing; methods GET; directory_listing on; }}\n\
+             }}\n"
+        ),
+    );
+
+    let _server = workspace.start("pipelining.conf", &[port]);
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect failed");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set read timeout failed");
+    stream
+        .write_all(
+            b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\nGET /listing/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .expect("write pipelined requests failed");
+
+    let mut responses = Vec::new();
+    stream
+        .read_to_end(&mut responses)
+        .expect("read pipelined responses failed");
+    assert_eq!(
+        responses
+            .windows(b"HTTP/1.1 200 OK".len())
+            .filter(|window| *window == b"HTTP/1.1 200 OK")
+            .count(),
+        2
+    );
+    let body = String::from_utf8_lossy(&responses);
+    assert!(body.contains("Localhost Test Home"));
+    assert!(body.contains("alpha.txt"));
 }
 
 #[test]
@@ -509,6 +555,55 @@ fn returns_expected_statuses_for_protocol_and_cgi_edge_cases() {
     );
     assert_eq!(response.status, 500);
     assert!(String::from_utf8_lossy(&response.body).contains("Custom 500"));
+}
+
+#[test]
+fn slow_cgi_does_not_block_other_clients() {
+    let workspace = TestWorkspace::new("cgi-concurrency");
+    workspace.create_site();
+    workspace.write_file(
+        "www/cgi/slow.py",
+        "#!/usr/bin/env python3\nimport time\ntime.sleep(1.2)\nprint('Content-Type: text/plain')\nprint()\nprint('slow')\n",
+    );
+    let port = free_port();
+    workspace.write_config(
+        "concurrency.conf",
+        &format!(
+            "request_timeout 3;\n\
+             cgi_timeout 3;\n\
+             server {{\n\
+                 host 127.0.0.1;\n\
+                 ports {port};\n\
+                 route / {{ root www; methods GET; index index.html; directory_listing off; }}\n\
+                 route /cgi {{ root www/cgi; methods GET POST; cgi .py /usr/bin/python3; }}\n\
+             }}\n"
+        ),
+    );
+
+    let _server = workspace.start("concurrency.conf", &[port]);
+    let slow_request = thread::spawn(move || {
+        http_request(
+            port,
+            b"GET /cgi/slow.py HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+    });
+    thread::sleep(Duration::from_millis(150));
+
+    let started = Instant::now();
+    let static_response = http_request(
+        port,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    let static_elapsed = started.elapsed();
+
+    assert_eq!(static_response.status, 200);
+    assert!(
+        static_elapsed < Duration::from_millis(700),
+        "static request was blocked by CGI for {static_elapsed:?}"
+    );
+    let slow_response = slow_request.join().expect("slow CGI request panicked");
+    assert_eq!(slow_response.status, 200);
+    assert!(String::from_utf8_lossy(&slow_response.body).contains("slow"));
 }
 
 #[test]

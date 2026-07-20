@@ -2,36 +2,47 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
 
-use crate::cgi::{self, CgiError};
 use crate::config::{RouteConfig, ServerConfig};
 use crate::http::{status_text, Method, Request, Response};
 use crate::server::SessionInfo;
 use crate::util::{content_type, html_escape, now_millis, sanitize_filename};
 
+pub enum HandlerResult {
+    Response(Response),
+    Cgi {
+        script: PathBuf,
+        interpreter: PathBuf,
+    },
+}
+
+impl From<Response> for HandlerResult {
+    fn from(response: Response) -> Self {
+        Self::Response(response)
+    }
+}
+
 pub fn handle_request(
     request: &Request,
     server: &ServerConfig,
     session: &SessionInfo,
-    cgi_timeout: Duration,
-) -> Response {
+) -> HandlerResult {
     if request.body.len() > server.client_max_body_size {
-        return error_response(413, server);
+        return error_response(413, server).into();
     }
 
     if request.path == "/session" {
-        return session_response(session);
+        return session_response(session).into();
     }
 
     let Some(route) = find_route(server, &request.path) else {
-        return error_response(404, server);
+        return error_response(404, server).into();
     };
 
     if !method_allowed(route, &request.method) {
         let mut response = error_response(405, server);
         response.set_header("Allow", route.allowed_methods_header());
-        return response;
+        return response.into();
     }
 
     if let Some(redirect) = &route.redirect {
@@ -46,17 +57,17 @@ pub fn handle_request(
             ),
         );
         response.set_header("Location", redirect.location.clone());
-        return response;
+        return response.into();
     }
 
     match request.method {
-        Method::Get => handle_get(request, route, server, cgi_timeout),
-        Method::Post => handle_post(request, route, server, cgi_timeout),
-        Method::Delete => handle_delete(request, route, server),
+        Method::Get => handle_get(request, route, server),
+        Method::Post => handle_post(request, route, server),
+        Method::Delete => handle_delete(request, route, server).into(),
         Method::Other(_) => {
             let mut response = error_response(405, server);
             response.set_header("Allow", route.allowed_methods_header());
-            response
+            response.into()
         }
     }
 }
@@ -77,38 +88,36 @@ fn method_allowed(route: &RouteConfig, method: &Method) -> bool {
     route.methods.is_empty() || route.methods.contains(method)
 }
 
-fn handle_get(
-    request: &Request,
-    route: &RouteConfig,
-    server: &ServerConfig,
-    cgi_timeout: Duration,
-) -> Response {
+fn handle_get(request: &Request, route: &RouteConfig, server: &ServerConfig) -> HandlerResult {
     let target = match route_file_path(route, &request.path) {
         Ok(path) => path,
-        Err(status) => return error_response(status, server),
+        Err(status) => return error_response(status, server).into(),
     };
 
     let target = match protect_existing_path(route, &target) {
         Ok(path) => path,
-        Err(status) => return error_response(status, server),
+        Err(status) => return error_response(status, server).into(),
     };
 
     if target.is_dir() {
-        return handle_directory_get(request, route, server, &target);
+        return handle_directory_get(request, route, server, &target).into();
     }
 
     if !target.exists() {
-        return error_response(404, server);
+        return error_response(404, server).into();
     }
     if !target.is_file() {
-        return error_response(403, server);
+        return error_response(403, server).into();
     }
 
     if let Some(interpreter) = cgi_interpreter(route, &target) {
-        return run_cgi(request, server, &target, interpreter, cgi_timeout);
+        return HandlerResult::Cgi {
+            script: target,
+            interpreter: interpreter.clone(),
+        };
     }
 
-    serve_file(&target, server)
+    serve_file(&target, server).into()
 }
 
 fn handle_directory_get(
@@ -131,35 +140,33 @@ fn handle_directory_get(
     error_response(403, server)
 }
 
-fn handle_post(
-    request: &Request,
-    route: &RouteConfig,
-    server: &ServerConfig,
-    cgi_timeout: Duration,
-) -> Response {
+fn handle_post(request: &Request, route: &RouteConfig, server: &ServerConfig) -> HandlerResult {
     let target = match route_file_path(route, &request.path) {
         Ok(path) => path,
-        Err(status) => return error_response(status, server),
+        Err(status) => return error_response(status, server).into(),
     };
 
     if target.exists() {
         match protect_existing_path(route, &target) {
             Ok(path) => {
                 if let Some(interpreter) = cgi_interpreter(route, &path) {
-                    return run_cgi(request, server, &path, interpreter, cgi_timeout);
+                    return HandlerResult::Cgi {
+                        script: path,
+                        interpreter: interpreter.clone(),
+                    };
                 }
             }
-            Err(status) => return error_response(status, server),
+            Err(status) => return error_response(status, server).into(),
         }
     }
 
     if let Some(upload_store) = &route.upload_store {
-        return save_upload(request, upload_store, server);
+        return save_upload(request, upload_store, server).into();
     }
 
     let mut response = Response::text(200, format!("received {} bytes\n", request.body.len()));
     response.set_header("Cache-Control", "no-store");
-    response
+    response.into()
 }
 
 fn handle_delete(request: &Request, route: &RouteConfig, server: &ServerConfig) -> Response {
@@ -253,14 +260,14 @@ fn directory_listing(request: &Request, directory: &Path, server: &ServerConfig)
     let mut entries = match fs::read_dir(directory) {
         Ok(entries) => entries
             .filter_map(Result::ok)
-            .filter_map(|entry| {
+            .map(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let display_name = if entry.path().is_dir() {
                     format!("{name}/")
                 } else {
                     name
                 };
-                Some(display_name)
+                display_name
             })
             .collect::<Vec<_>>(),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
@@ -468,24 +475,6 @@ fn cgi_interpreter<'a>(route: &'a RouteConfig, path: &Path) -> Option<&'a PathBu
     let extension = path.extension()?.to_str()?;
     let key = format!(".{extension}");
     route.cgi.get(&key)
-}
-
-fn run_cgi(
-    request: &Request,
-    server: &ServerConfig,
-    path: &Path,
-    interpreter: &Path,
-    timeout: Duration,
-) -> Response {
-    match cgi::run(request, path, interpreter, timeout) {
-        Ok(response) => response,
-        Err(CgiError::Timeout) => error_response(504, server),
-        Err(CgiError::Io(error)) => {
-            eprintln!("cgi I/O error: {error}");
-            error_response(500, server)
-        }
-        Err(CgiError::InvalidOutput) => error_response(500, server),
-    }
 }
 
 fn session_response(session: &SessionInfo) -> Response {

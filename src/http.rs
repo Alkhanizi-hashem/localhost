@@ -66,9 +66,7 @@ impl Request {
                 .split(',')
                 .any(|value| value.trim() == "keep-alive")
         } else {
-            connection
-                .split(',')
-                .any(|value| value.trim() == "close")
+            connection.split(',').any(|value| value.trim() == "close")
         }
     }
 }

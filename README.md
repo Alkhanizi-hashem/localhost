@@ -47,6 +47,7 @@ The integration tests start the compiled server binary and verify:
 - multi-port listeners and virtual hosts
 - chunked CGI requests
 - CGI timeout and failure handling
+- concurrent static traffic while CGI is running
 - mixed valid/invalid server blocks in one config
 
 ## Config Syntax
@@ -80,4 +81,4 @@ Audit-ready example configs are available in `config/`:
 - `body-limit.conf`
 - `duplicate-port.conf`
 
-The implementation uses one process, one thread, non-blocking sockets, and Linux `epoll` for all socket reads and writes. HTTP/1.1 connections stay open by default and close only when requested or when the server terminates the exchange.
+The server uses one thread and one Linux `epoll` instance for listeners, clients, and non-blocking CGI pipes. CGI scripts run as child processes without blocking the server event loop. HTTP/1.1 connections stay open by default and close only when requested or when the server terminates the exchange.

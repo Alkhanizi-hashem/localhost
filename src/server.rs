@@ -5,18 +5,20 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::panic::{self, AssertUnwindSafe};
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
+use crate::cgi::{CgiError, CgiProcess};
+use crate::config::{Config, ServerConfig};
 use crate::epoll::Epoll;
-use crate::ffi::{
-    set_nonblocking, EpollEvent, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDHUP,
-};
+use crate::ffi::{set_nonblocking, EpollEvent, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDHUP};
 use crate::http::{parse_request, ParseResult, Request, Response};
-use crate::router::{error_response, handle_request};
+use crate::router::{error_response, handle_request, HandlerResult};
 use crate::util::{host_without_port, now_millis};
 
 const CLIENT_READ_EVENTS: u32 = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
 const CLIENT_READ_WRITE_EVENTS: u32 = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+const CLIENT_WAIT_EVENTS: u32 = EPOLLERR | EPOLLHUP | EPOLLRDHUP;
 const LISTENER_EVENTS: u32 = EPOLLIN | EPOLLERR | EPOLLHUP;
+const CGI_STDOUT_EVENTS: u32 = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+const CGI_STDIN_EVENTS: u32 = EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
 const READ_BUFFER_SIZE: usize = 16 * 1024;
 const SESSION_COOKIE: &str = "LOCALHOST_SESSION";
 
@@ -49,6 +51,30 @@ struct Client {
     close_after_write: bool,
     max_body_size: usize,
     last_active: Instant,
+    waiting_cgi: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum CgiPipe {
+    Stdin(u64),
+    Stdout(u64),
+}
+
+impl CgiPipe {
+    fn job_id(self) -> u64 {
+        match self {
+            Self::Stdin(job_id) | Self::Stdout(job_id) => job_id,
+        }
+    }
+}
+
+struct CgiJob {
+    process: CgiProcess,
+    client_fd: RawFd,
+    server: ServerConfig,
+    session: SessionInfo,
+    close_after_write: bool,
+    http10: bool,
 }
 
 pub struct Server {
@@ -58,6 +84,9 @@ pub struct Server {
     clients: HashMap<RawFd, Client>,
     sessions: HashMap<String, Session>,
     session_counter: u64,
+    cgi_jobs: HashMap<u64, CgiJob>,
+    cgi_pipes: HashMap<RawFd, CgiPipe>,
+    cgi_counter: u64,
 }
 
 impl Server {
@@ -70,6 +99,9 @@ impl Server {
             clients: HashMap::new(),
             sessions: HashMap::new(),
             session_counter: 0,
+            cgi_jobs: HashMap::new(),
+            cgi_pipes: HashMap::new(),
+            cgi_counter: 0,
         };
 
         let warnings = server.bind_listeners()?;
@@ -99,23 +131,39 @@ impl Server {
 
         let mut events = vec![EpollEvent::empty(); 256];
         loop {
-            let ready = self.epoll.wait(&mut events, 1000)?;
+            let ready = self.epoll.wait(&mut events, 100)?;
             for event in events.iter().take(ready) {
                 let fd = event.data as RawFd;
                 if self.listeners.contains_key(&fd) {
-                    if let Err(_panic) = panic::catch_unwind(AssertUnwindSafe(|| self.accept_clients(fd))) {
+                    if let Err(_panic) =
+                        panic::catch_unwind(AssertUnwindSafe(|| self.accept_clients(fd)))
+                    {
                         eprintln!("listener handler panicked on fd {fd}");
                     }
                 } else if self.clients.contains_key(&fd) {
-                    if let Err(_panic) =
-                        panic::catch_unwind(AssertUnwindSafe(|| self.handle_client_event(fd, event.events)))
-                    {
+                    if let Err(_panic) = panic::catch_unwind(AssertUnwindSafe(|| {
+                        self.handle_client_event(fd, event.events)
+                    })) {
                         eprintln!("client handler panicked on fd {fd}");
                         self.close_client(fd);
                     }
+                } else if self.cgi_pipes.contains_key(&fd) {
+                    if let Err(_panic) = panic::catch_unwind(AssertUnwindSafe(|| {
+                        self.handle_cgi_event(fd, event.events)
+                    })) {
+                        eprintln!("CGI handler panicked on fd {fd}");
+                        if let Some(pipe) = self.cgi_pipes.get(&fd).copied() {
+                            self.finish_cgi_job(pipe.job_id(), Err(CgiError::InvalidOutput));
+                        }
+                    }
                 }
             }
-            if let Err(_panic) = panic::catch_unwind(AssertUnwindSafe(|| self.close_timed_out_clients())) {
+            if let Err(_panic) = panic::catch_unwind(AssertUnwindSafe(|| self.poll_cgi_jobs())) {
+                eprintln!("CGI cleanup panicked");
+            }
+            if let Err(_panic) =
+                panic::catch_unwind(AssertUnwindSafe(|| self.close_timed_out_clients()))
+            {
                 eprintln!("timeout cleanup panicked");
             }
             if let Err(_panic) = panic::catch_unwind(AssertUnwindSafe(|| self.expire_sessions())) {
@@ -247,6 +295,7 @@ impl Server {
                 close_after_write: false,
                 max_body_size,
                 last_active: Instant::now(),
+                waiting_cgi: None,
             },
         );
         Ok(())
@@ -258,21 +307,21 @@ impl Server {
             return;
         }
 
-        if events & EPOLLIN != 0 {
-            self.read_client(fd);
-            if !self.clients.contains_key(&fd) {
-                return;
-            }
-        }
-
         let has_response = self
             .clients
             .get(&fd)
             .map(|client| !client.write_buffer.is_empty())
             .unwrap_or(false);
 
-        if has_response && events & EPOLLOUT != 0 {
-            self.write_client(fd);
+        if has_response {
+            if events & EPOLLOUT != 0 {
+                self.write_client(fd);
+                if !self.clients.contains_key(&fd) {
+                    return;
+                }
+            }
+        } else if events & EPOLLIN != 0 {
+            self.read_client(fd);
             if !self.clients.contains_key(&fd) {
                 return;
             }
@@ -323,7 +372,10 @@ impl Server {
                 if let Some(client) = self.clients.get_mut(&fd) {
                     client.read_buffer.drain(..consumed);
                 }
-                self.response_for_request(fd, request)
+                let Some(response) = self.response_for_request(fd, request) else {
+                    return;
+                };
+                response
             }
             ParseResult::Incomplete => return,
             ParseResult::BadRequest(message) => {
@@ -336,15 +388,71 @@ impl Server {
         self.queue_response(fd, response.0, response.1);
     }
 
-    fn response_for_request(&mut self, fd: RawFd, request: Request) -> (Response, bool) {
+    fn response_for_request(&mut self, fd: RawFd, request: Request) -> Option<(Response, bool)> {
         let Some(server_index) = self.select_server_index(fd, &request) else {
-            return (Response::text(500, "server configuration not found\n"), true);
+            return Some((
+                Response::text(500, "server configuration not found\n"),
+                true,
+            ));
         };
         let server = self.config.servers[server_index].clone();
         let close_after_write = request.should_close_connection();
+        let http10 = request.version == "HTTP/1.0";
         let session = self.touch_session(&request);
-        let mut response = handle_request(&request, &server, &session, self.config.cgi_timeout);
+        match handle_request(&request, &server, &session) {
+            HandlerResult::Response(mut response) => {
+                Self::decorate_response(&mut response, &session, close_after_write, http10);
+                Some((response, close_after_write))
+            }
+            HandlerResult::Cgi {
+                script,
+                interpreter,
+            } => {
+                match CgiProcess::spawn(&request, &script, &interpreter, self.config.cgi_timeout) {
+                    Ok(process) => {
+                        if let Err(error) = self.start_cgi_job(
+                            fd,
+                            process,
+                            server.clone(),
+                            session.clone(),
+                            close_after_write,
+                            http10,
+                        ) {
+                            eprintln!("failed to register CGI process: {error}");
+                            let mut response = error_response(500, &server);
+                            Self::decorate_response(
+                                &mut response,
+                                &session,
+                                close_after_write,
+                                http10,
+                            );
+                            Some((response, close_after_write))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(CgiError::Io(error)) => {
+                        eprintln!("cgi I/O error: {error}");
+                        let mut response = error_response(500, &server);
+                        Self::decorate_response(&mut response, &session, close_after_write, http10);
+                        Some((response, close_after_write))
+                    }
+                    Err(CgiError::Timeout | CgiError::InvalidOutput) => {
+                        let mut response = error_response(500, &server);
+                        Self::decorate_response(&mut response, &session, close_after_write, http10);
+                        Some((response, close_after_write))
+                    }
+                }
+            }
+        }
+    }
 
+    fn decorate_response(
+        response: &mut Response,
+        session: &SessionInfo,
+        close_after_write: bool,
+        http10: bool,
+    ) {
         if session.is_new {
             response.set_header(
                 "Set-Cookie",
@@ -357,10 +465,9 @@ impl Server {
         response.set_header("X-Session-Visits", session.visits.to_string());
         if close_after_write {
             response.set_header("Connection", "close");
-        } else if request.version == "HTTP/1.0" {
+        } else if http10 {
             response.set_header("Connection", "keep-alive");
         }
-        (response, close_after_write)
     }
 
     fn response_for_bad_request(&mut self, fd: RawFd, status: u16) -> Response {
@@ -459,6 +566,155 @@ impl Server {
         }
     }
 
+    fn start_cgi_job(
+        &mut self,
+        client_fd: RawFd,
+        process: CgiProcess,
+        server: ServerConfig,
+        session: SessionInfo,
+        close_after_write: bool,
+        http10: bool,
+    ) -> io::Result<()> {
+        self.cgi_counter = self.cgi_counter.saturating_add(1);
+        let job_id = self.cgi_counter;
+        let stdin_fd = process.stdin_fd();
+        let stdout_fd = process.stdout_fd();
+
+        if let Some(fd) = stdout_fd {
+            self.epoll.add(fd, CGI_STDOUT_EVENTS)?;
+        }
+        if let Some(fd) = stdin_fd {
+            if let Err(error) = self.epoll.add(fd, CGI_STDIN_EVENTS) {
+                if let Some(stdout_fd) = stdout_fd {
+                    self.epoll.delete(stdout_fd);
+                }
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.epoll.modify(client_fd, CLIENT_WAIT_EVENTS) {
+            if let Some(fd) = stdin_fd {
+                self.epoll.delete(fd);
+            }
+            if let Some(fd) = stdout_fd {
+                self.epoll.delete(fd);
+            }
+            return Err(error);
+        }
+
+        if let Some(fd) = stdin_fd {
+            self.cgi_pipes.insert(fd, CgiPipe::Stdin(job_id));
+        }
+        if let Some(fd) = stdout_fd {
+            self.cgi_pipes.insert(fd, CgiPipe::Stdout(job_id));
+        }
+        self.cgi_jobs.insert(
+            job_id,
+            CgiJob {
+                process,
+                client_fd,
+                server,
+                session,
+                close_after_write,
+                http10,
+            },
+        );
+        if let Some(client) = self.clients.get_mut(&client_fd) {
+            client.waiting_cgi = Some(job_id);
+            client.last_active = Instant::now();
+        }
+        Ok(())
+    }
+
+    fn handle_cgi_event(&mut self, fd: RawFd, events: u32) {
+        let Some(pipe) = self.cgi_pipes.get(&fd).copied() else {
+            return;
+        };
+        let job_id = pipe.job_id();
+        let result = match (pipe, self.cgi_jobs.get_mut(&job_id)) {
+            (CgiPipe::Stdin(_), Some(job)) => {
+                if events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP) != 0 {
+                    job.process.close_stdin();
+                    Ok(true)
+                } else if events & EPOLLOUT != 0 {
+                    job.process.write_stdin_once()
+                } else {
+                    Ok(false)
+                }
+            }
+            (CgiPipe::Stdout(_), Some(job)) if events & CGI_STDOUT_EVENTS != 0 => {
+                job.process.read_stdout_once()
+            }
+            _ => return,
+        };
+
+        match result {
+            Ok(true) => {
+                self.epoll.delete(fd);
+                self.cgi_pipes.remove(&fd);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.finish_cgi_job(job_id, Err(error));
+                return;
+            }
+        }
+        self.poll_cgi_job(job_id);
+    }
+
+    fn poll_cgi_jobs(&mut self) {
+        let job_ids = self.cgi_jobs.keys().copied().collect::<Vec<_>>();
+        for job_id in job_ids {
+            self.poll_cgi_job(job_id);
+        }
+    }
+
+    fn poll_cgi_job(&mut self, job_id: u64) {
+        let result = self
+            .cgi_jobs
+            .get_mut(&job_id)
+            .and_then(|job| job.process.poll());
+        if let Some(result) = result {
+            self.finish_cgi_job(job_id, result);
+        }
+    }
+
+    fn finish_cgi_job(&mut self, job_id: u64, result: Result<Response, CgiError>) {
+        let Some(job) = self.cgi_jobs.remove(&job_id) else {
+            return;
+        };
+        let pipe_fds = self
+            .cgi_pipes
+            .iter()
+            .filter_map(|(fd, pipe)| (pipe.job_id() == job_id).then_some(*fd))
+            .collect::<Vec<_>>();
+        for fd in pipe_fds {
+            self.epoll.delete(fd);
+            self.cgi_pipes.remove(&fd);
+        }
+
+        let Some(client) = self.clients.get_mut(&job.client_fd) else {
+            return;
+        };
+        client.waiting_cgi = None;
+
+        let mut response = match result {
+            Ok(response) => response,
+            Err(CgiError::Timeout) => error_response(504, &job.server),
+            Err(CgiError::Io(error)) => {
+                eprintln!("cgi I/O error: {error}");
+                error_response(500, &job.server)
+            }
+            Err(CgiError::InvalidOutput) => error_response(500, &job.server),
+        };
+        Self::decorate_response(
+            &mut response,
+            &job.session,
+            job.close_after_write,
+            job.http10,
+        );
+        self.queue_response(job.client_fd, response, job.close_after_write);
+    }
+
     fn select_server_index(&self, fd: RawFd, request: &Request) -> Option<usize> {
         let client = self.clients.get(&fd)?;
         let listener = self.listeners.get(&client.listen_fd)?;
@@ -525,7 +781,8 @@ impl Server {
             .clients
             .iter()
             .filter_map(|(fd, client)| {
-                if now.duration_since(client.last_active) >= timeout {
+                if client.waiting_cgi.is_none() && now.duration_since(client.last_active) >= timeout
+                {
                     Some(*fd)
                 } else {
                     None
@@ -562,6 +819,20 @@ impl Server {
     }
 
     fn close_client(&mut self, fd: RawFd) {
+        if let Some(job_id) = self.clients.get(&fd).and_then(|client| client.waiting_cgi) {
+            if let Some(job) = self.cgi_jobs.remove(&job_id) {
+                drop(job);
+            }
+            let pipe_fds = self
+                .cgi_pipes
+                .iter()
+                .filter_map(|(pipe_fd, pipe)| (pipe.job_id() == job_id).then_some(*pipe_fd))
+                .collect::<Vec<_>>();
+            for pipe_fd in pipe_fds {
+                self.epoll.delete(pipe_fd);
+                self.cgi_pipes.remove(&pipe_fd);
+            }
+        }
         self.epoll.delete(fd);
         self.clients.remove(&fd);
     }
